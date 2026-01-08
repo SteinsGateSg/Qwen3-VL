@@ -9,6 +9,7 @@ class ModelArguments:
     tune_mm_llm: bool = field(default=False)
     tune_mm_mlp: bool = field(default=False)
     tune_mm_vision: bool = field(default=False)
+    tune_prompt: bool = field(default=False)
 
 @dataclass
 class DataArguments:
@@ -43,3 +44,7 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_r: int = field(default=64)
     lora_alpha: int = field(default=128)
     lora_dropout: float = field(default=0.0)
+
+    prompt_length: int = field(default=16)
+    contrastive_loss_weight: float = field(default=0.0)
+    contrastive_temperature: float = field(default=0.07)
