@@ -18,6 +18,7 @@ import os
 import logging
 import pathlib
 import torch
+import torch.nn as nn
 import transformers
 import sys
 from pathlib import Path
@@ -87,6 +88,70 @@ def set_model(model_args, model):
         for n, p in model.language_model.named_parameters():
             p.requires_grad = False
         model.lm_head.requires_grad = False
+
+
+class PromptTuningWrapper(nn.Module):
+    def __init__(self, base_model, prompt_length: int):
+        super().__init__()
+        self.base_model = base_model
+        self.prompt_length = prompt_length
+        hidden_size = getattr(base_model.config, "hidden_size", None)
+        if hidden_size is None:
+            hidden_size = base_model.language_model.config.hidden_size
+        embed_dtype = self.base_model.get_input_embeddings().weight.dtype
+        self.prompt_embeddings = nn.Parameter(
+            torch.zeros(prompt_length, hidden_size, dtype=embed_dtype)
+        )
+        nn.init.normal_(self.prompt_embeddings, mean=0.0, std=0.02)
+        self.config = base_model.config
+        self.generation_config = getattr(base_model, "generation_config", None)
+
+    def get_input_embeddings(self):
+        return self.base_model.get_input_embeddings()
+
+    def set_input_embeddings(self, value):
+        return self.base_model.set_input_embeddings(value)
+
+    def get_output_embeddings(self):
+        return self.base_model.get_output_embeddings()
+
+    def forward(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
+        if input_ids is None:
+            raise ValueError("Prompt tuning requires input_ids to build embeddings.")
+        inputs_embeds = self.get_input_embeddings()(input_ids)
+        batch_size = inputs_embeds.shape[0]
+        prompt_embeds = self.prompt_embeddings.unsqueeze(0).expand(
+            batch_size, -1, -1
+        )
+        inputs_embeds = torch.cat([prompt_embeds, inputs_embeds], dim=1)
+
+        if attention_mask is None:
+            attention_mask = torch.ones(
+                input_ids.shape, dtype=torch.long, device=input_ids.device
+            )
+        prompt_attention = torch.ones(
+            (batch_size, self.prompt_length),
+            dtype=attention_mask.dtype,
+            device=attention_mask.device,
+        )
+        attention_mask = torch.cat([prompt_attention, attention_mask], dim=1)
+
+        if labels is not None:
+            prompt_labels = torch.full(
+                (batch_size, self.prompt_length),
+                -100,
+                dtype=labels.dtype,
+                device=labels.device,
+            )
+            labels = torch.cat([prompt_labels, labels], dim=1)
+
+        kwargs.pop("input_ids", None)
+        return self.base_model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            labels=labels,
+            **kwargs,
+        )
 
 
 def train(attn_implementation="flash_attention_2"):
@@ -160,6 +225,9 @@ def train(attn_implementation="flash_attention_2"):
         use_fast=False,
     )
 
+    if training_args.lora_enable and model_args.tune_prompt:
+        raise ValueError("LoRA and prompt tuning cannot be enabled together.")
+
     if training_args.lora_enable:
         from peft import LoraConfig, get_peft_model, TaskType
         print("LoRA enabled")
@@ -177,11 +245,23 @@ def train(attn_implementation="flash_attention_2"):
         )
         model = get_peft_model(model, lora_config)
     else:
-        set_model(model_args, model)
+        if model_args.tune_prompt:
+            for p in model.parameters():
+                p.requires_grad = False
+            model = PromptTuningWrapper(model, training_args.prompt_length)
+            model.prompt_embeddings.requires_grad = True
+        else:
+            set_model(model_args, model)
 
         if torch.distributed.get_rank() == 0:
-            model.visual.print_trainable_parameters()
-            model.model.print_trainable_parameters()
+            if hasattr(model, "visual"):
+                model.visual.print_trainable_parameters()
+            if hasattr(model, "model"):
+                model.model.print_trainable_parameters()
+            if hasattr(model, "prompt_embeddings"):
+                trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                total = sum(p.numel() for p in model.parameters())
+                print(f"prompt trainable params: {trainable} / {total}")
     
     data_module = make_supervised_data_module(processor, data_args=data_args)
     trainer = Trainer(
